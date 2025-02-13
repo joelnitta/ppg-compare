@@ -189,14 +189,155 @@ compare_taxonomy <- function(wfo_pterido_table, ppgi_table) {
     rename_with(~ str_replace_all(., "\\.x", "_wfo")) |>
     rename_with(~ str_replace_all(., "\\.y", "_ppgi")) |>
     rename_with(~ paste0(., "_wfo"), c(subtribe, tribe, subclass, phylum)) |>
-    mutate(matches = replace_na(matches, FALSE))
+    mutate(matches = replace_na(matches, FALSE)) |>
+    rename(genus_wfo = genus)
 }
 
-filter_to_mismatches <- function(comparison_full) {
+filter_to_mismatches <- function(comparison_full, ppg_vote_results) {
   comparison_full |>
     filter(!matches) |>
     select(-matches) |>
     arrange(
       phylum_wfo, class_wfo, subclass_wfo, order_wfo, family_wfo, subtribe_wfo,
-      tribe_wfo, subtribe_wfo, genus)
+      tribe_wfo, subtribe_wfo, genus_wfo)
+}
+
+# Extract useful information to dataframe
+fetch_issues <- function(repo, n_max = 1000) {
+
+  issues_json <-
+    glue::glue("https://api.github.com/repos/{repo}/issues?state=all&page=1&per_page={n_max}") |>
+    jsonlite::fromJSON()
+
+  # Create initial tibble of issues (may include PRs)
+  issues_df <- tibble::tibble(
+    number = issues_json$number,
+    title = issues_json$title,
+    url = issues_json$url,
+    created_at = issues_json$created_at,
+    user = issues_json$user$login,
+    state = issues_json$state,
+    body = issues_json$body
+  )
+
+  if (nrow(issues_df) == n_max) {
+    stop("Maximum number of issues fetched; increase n_max")
+  }
+
+  # If any PRs exist, remove them
+  if (!is.null(issues_json$draft)) {
+    issues_df <-
+      issues_df |>
+      dplyr::mutate(draft = issues_json$draft) |>
+      dplyr::filter(is.na(draft)) |>
+      dplyr::select(-draft)
+  }
+
+  # Format final data frame
+  issues_df |>
+    dplyr::mutate(
+    url = stringr::str_replace_all(
+      url, "https://api.github.com/repos/", "https://github.com/"),
+    name = stringr::str_match(body, "Name of taxon[\r|\n]*(×*.*)") |>
+             magrittr::extract(, 2),
+    rank = stringr::str_match(body, "Rank of taxon[\r|\n]*(\\w+)[\r|\n]*") |>
+             magrittr::extract(, 2),
+    no_species = stringr::str_match(
+      body, "number of species affected[\r|\n]*(.*)") |>
+       magrittr::extract(, 2),
+    description = stringr::str_match(
+      body, "Description of change[\r|\n]*(.*)") |>
+        magrittr::extract(, 2)
+  ) |>
+    dplyr::select(-body)
+}
+
+# Fetch list of taxa that have passed PPG voting on GitHub
+fetch_ppg_vote_results <- function() {
+  # Download list of issues (proposals)
+  issues <-
+    fetch_issues("pteridogroup/ppg") %>%
+    select(number, title, name, rank, created_at) %>%
+    filter(!str_detect(title, "\\[NOT VALID\\]")) %>%
+    mutate(passed = str_detect(title, "\\[PASSED\\]")) %>%
+    mutate(not_passed = str_detect(title, "\\[NOT PASSED\\]")) %>%
+    mutate(voting = !str_detect(title, "PASSED")) %>%
+    mutate(created_at = str_remove_all(created_at, "T.*Z") %>%
+      lubridate::ymd()) %>%
+    mutate(month = lubridate::month(created_at) %>%
+      str_pad(side = "left", pad = "0", width = 2)) %>%
+    mutate(year = lubridate::year(created_at)) %>%
+    mutate(year_month = paste(year, month, sep = "-"))
+
+  # Filter to approved names, include issue number and rank
+  issues %>%
+    mutate(
+      taxon = str_replace_all(name, "and", ",") %>%
+        str_squish()
+    ) %>%
+    separate_rows(taxon, sep = ",") %>%
+    mutate(
+      taxon = str_squish(taxon),
+      rank = str_to_lower(rank)
+      ) %>%
+    select(number, passed, taxon, rank, title)
+}
+
+# Add data about Issues on GitHub for a particular rank
+join_issue_at_rank <- function(
+    comparison_mismatches, ppg_vote_results, rank_select, coalesce = TRUE) {
+
+  to_join <- ppg_vote_results |>
+    # Treat nothogenus as genus
+    mutate(rank = stringr::str_replace_all(rank, "nothogenus", "genus")) |>
+    filter(rank == rank_select) |>
+    select(-rank)
+
+  res <-
+    comparison_mismatches |>
+    left_join(
+      to_join,
+      by = set_names("taxon", paste0(rank_select, "_wfo"))
+    )
+
+  if (!isTRUE(coalesce)) {
+    return(res)
+  }
+
+  res |>
+    mutate(number = coalesce(number.x, number.y)) |>
+    select(-number.x) |>
+    select(-number.y) |>
+    mutate(title = coalesce(title.x, title.y)) |>
+    select(-title.x) |>
+    select(-title.y) |>
+    mutate(passed = coalesce(passed.x, passed.y)) |>
+    select(-passed.x) |>
+    select(-passed.y)
+}
+
+# Add data about Issues on GitHub for genus, subfamily, and family in WFO data
+join_issues <- function(comparison_mismatches, ppg_vote_results) {
+  comparison_mismatches |>
+    mutate(genus_wfo = str_remove_all(genus_wfo, "×  ")) |>
+    join_issue_at_rank(ppg_vote_results, "genus", coalesce = FALSE) |>
+    join_issue_at_rank(ppg_vote_results, "subfamily") |>
+    join_issue_at_rank(ppg_vote_results, "family") |>
+    join_issue_at_rank(ppg_vote_results, "order") |>
+    join_issue_at_rank(ppg_vote_results, "class") |>
+    mutate(
+      number = as.character(number),
+      number = case_when(
+        !is.na(number) ~ paste0(
+          "https://github.com/pteridogroup/ppg/issues/", number
+        ),
+        .default = number
+      )
+    ) |>
+    rename(issue = number)
+}
+
+write_xlsx_tar <- function(data, path) {
+  openxlsx::write.xlsx(x = data, file = path)
+  path
 }
